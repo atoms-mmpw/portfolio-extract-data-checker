@@ -1,0 +1,13 @@
+{
+    "name": "entity-id-xlsx-checker",
+    "version": "1.0.0",
+    "private": true,
+    "description": "CLI: list .xlsx files whose filename Entity ID is missing from column I. Run: npm run check-entity-ids -- [dir]; default dir from ENTITY_LIST_DIR or /mnt/data/portfolio-data-extractor/Entity-List-Report-2024-03-24",
+    "type": "module",
+    "scripts": {
+      "check-entity-ids": "node check-entity-ids.js"
+    },
+    "dependencies": {
+      "xlsx": "^0.18.5"
+    }
+  }
