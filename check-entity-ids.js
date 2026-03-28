@@ -20,7 +20,7 @@ import path from "node:path";
 import * as XLSX from "xlsx";
 
 const DEFAULT_DIR =
-  "/mnt/data/portfolio-data-extractor/Entity-List-Report-2024-03-24";
+  "/mnt/data/portfolio-data-extractor/Entity-List-Report-2026-03-27";
 
 const COL_I_INDEX = 8; // 0-based: column I
 

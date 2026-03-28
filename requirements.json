@@ -1,0 +1,222 @@
+{
+    "model": "voxtral-mini-2602",
+    "text": "What we want to do is open up each of the files that come from Xplan, the raw extracts. Look on sheet two and that shows each of the portfolios. If the column D, which is titled MMPW model portfolio, is premium, then we know we need to check whether the holdings inside that portfolio fall within the allowed menu of stocks. So if it's premium in column D, we know we need to check it. The question is which which menu we need to make sure all the stocks fall within. So if column E, which is direct equities model, is sustainable, Then we've got column D, which is premium, column E, which is sustainable. And then we know we need to fall within the sustainable menu, which is 24 stocks. If, on the other hand, column E is anything other than sustainable, then it's the 30 stocks of the agnostic.30 stock menu that the holdings are allowed to fall within. So those, the menu of stocks, whether they're sustainable or agnostic, they are inside the portfolio rebalance template. So we're going to have to, when we run this process, we need to first load up the latest template and then we at least, we can load the 30 and the 24 menus into memory. So the sustainable and the agnostic menus into memory. Then we got those handy. So back on the extract file, for every portfolio on sheet two that is premium, either sustainable or agnostic, depending on the value of column E, we have to get the scroll across to column L, which is titled external ID. And grab that ID, go to sheet one, and filter all the holdings that equal that external ID. So on sheet one, that external ID is in column J, also titled external ID. So we need to filter just those holdings that match that external ID. Then in column B,E, we've got the tickers for all of the holdings. So first of all, we need to ignore anything which isn't just a plain old boring stock. So anything which has a ticker more than three characters long, we can ignore those. So filter them out. That leaves us with a list of just the real stocks. It's those tickers that are finally left there, which we need to make sure are within the correct menu, either the 30 or the 24. If they aren't, if we find a stock which is outside of that, we need to flag that.",
+    "segments": [
+      {
+        "type": "transcription_segment",
+        "text": "What we want to do is open up each of the files that come from Xplan, the raw extracts.",
+        "start": 0.5,
+        "end": 6.3,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " Look on sheet two and that shows each of the portfolios.",
+        "start": 7.3,
+        "end": 13.8,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " If the column D, which is titled MMPW model portfolio,",
+        "start": 15.6,
+        "end": 21.7,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " is premium, then we know we need to check whether the holdings inside that portfolio fall within the allowed menu of stocks.",
+        "start": 22.3,
+        "end": 36.1,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " So if it's premium in column D, we know we need to check it.",
+        "start": 36.9,
+        "end": 42.7,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " The question is which",
+        "start": 42.7,
+        "end": 44,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " which menu we need to make sure all the stocks fall within.",
+        "start": 46.2,
+        "end": 52.5,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " So if column E, which is direct equities model, is sustainable,",
+        "start": 53.2,
+        "end": 62.1,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " Then we've got column D, which is premium, column E, which is sustainable.",
+        "start": 63.4,
+        "end": 67.5,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " And then we know we need to fall within the sustainable menu, which is 24 stocks.",
+        "start": 68,
+        "end": 77.1,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " If, on the other hand, column E is anything other than sustainable, then it's the 30 stocks of the agnostic.",
+        "start": 78.8,
+        "end": 89.8,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": "30 stock menu that the holdings are allowed to fall within.",
+        "start": 90.1,
+        "end": 94.8,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " So those, the menu of stocks, whether they're sustainable or agnostic, they are inside the portfolio rebalance template.",
+        "start": 96.3,
+        "end": 108.1,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " So we're going to have to, when we run this process, we need to first load up the latest template and then we at least, we can load the 30 and the 24 menus into memory.",
+        "start": 108.7,
+        "end": 123.6,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " So the sustainable and the agnostic menus into memory.",
+        "start": 123.7,
+        "end": 128.1,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " Then we got those handy.",
+        "start": 128.1,
+        "end": 129.5,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " So back on the extract file, for every portfolio on sheet two that is premium,",
+        "start": 130.3,
+        "end": 139.4,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " either sustainable or agnostic, depending on the value of column E, we have to get the scroll across to column L, which is titled external ID.",
+        "start": 141.6,
+        "end": 153.2,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " And grab that ID, go to sheet one, and filter all the holdings that equal that external ID.",
+        "start": 154.3,
+        "end": 166.2,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " So on sheet one, that external ID is in column J, also titled external ID.",
+        "start": 166.2,
+        "end": 170.4,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " So we need to filter just those holdings that match that external ID.",
+        "start": 171.4,
+        "end": 177.3,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " Then in column B,",
+        "start": 178.7,
+        "end": 180,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": "E, we've got the tickers for all of the holdings.",
+        "start": 180,
+        "end": 184.6,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " So first of all, we need to ignore anything which isn't just a plain old boring stock.",
+        "start": 186.4,
+        "end": 191.7,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " So anything which has a ticker more than three characters long, we can ignore those.",
+        "start": 192.5,
+        "end": 198.6,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " So filter them out.",
+        "start": 198.7,
+        "end": 199.7,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " That leaves us with a list of just the real stocks.",
+        "start": 200.4,
+        "end": 204.1,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " It's those tickers that are finally left there, which we need to make sure are within the correct menu, either the 30 or the 24.",
+        "start": 204.6,
+        "end": 214,
+        "speakerId": "speaker_1"
+      },
+      {
+        "type": "transcription_segment",
+        "text": " If they aren't, if we find a stock which is outside of that, we need to flag that.",
+        "start": 215.6,
+        "end": 221.1,
+        "speakerId": "speaker_1"
+      }
+    ],
+    "usage": {
+      "promptTokens": 20,
+      "completionTokens": 789,
+      "totalTokens": 809,
+      "promptAudioSeconds": 223,
+      "additionalProperties": {
+        "request_count": 4
+      }
+    },
+    "language": null,
+    "additionalProperties": {
+      "type": "transcription.done"
+    }
+  }
