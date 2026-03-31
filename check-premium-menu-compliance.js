@@ -123,6 +123,12 @@ const HEADER_EX_GAMBLING_ALIASES = [
 
 const MIN_MENU_TICKERS = 20;
 
+/**
+ * Tickers that should be ignored for compliance checks even if they are holdings
+ * and not present in the valid menu.
+ */
+const WHITELISTED_TICKERS = new Set(["MVE", "VIF"]);
+
 const READ_OPTS = {
   type: "buffer",
   cellDates: false,
@@ -634,7 +640,9 @@ function evaluateWorkbook(workbookPath, workbook, menus) {
     }
 
     const unique = [...new Set(tickers)];
-    const offenders = unique.filter((t) => !menuSet.has(t));
+    const offenders = unique.filter(
+      (t) => !menuSet.has(t) && !WHITELISTED_TICKERS.has(t)
+    );
     if (offenders.length > 0) {
       result.flagged.push({
         row: r + 1,
