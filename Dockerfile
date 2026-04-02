@@ -13,7 +13,7 @@ WORKDIR /app
 COPY . .
 
 # Install dependencies
-#RUN npm install
+RUN npm install
 
 # Copy and set up Git configuration script
 COPY scripts/setup-git.sh /usr/local/bin/setup-git.sh
