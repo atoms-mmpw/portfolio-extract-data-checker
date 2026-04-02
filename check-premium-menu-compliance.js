@@ -16,8 +16,9 @@
  *  4. listInputFiles() — resolve path to a sorted list of workbook files.
  *  5. If none found, [FATAL] and exit 1.
  *  6. For each file: read with SheetJS, evaluateWorkbook() (Phase 3), printResult().
- *  7. Print [SUMMARY] totals. Exit 1 if any file had a fatal error or any [FLAG] rows;
- *     exit 0 only when every file succeeded and no violations.
+ *  7. Write dated JSON snapshot (summary + offending rows) under OFFENDING_OUTPUT_DIR; prune
+ *     snapshots older than 6 months. Print [SUMMARY] totals. Exit 1 if any file had a fatal
+ *     error or any [FLAG] rows; exit 0 only when every file succeeded and no violations.
  *
  * ---------------------------------------------------------------------------
  * Phase 2 — Template menus (loadMenus, pickTemplateSheet, scanMenusOnSheet)
@@ -47,11 +48,11 @@
  *  3. Sheet2 row 1 = headers. resolveExtractColumns() maps titles (case-insensitive) to
  *     column indices: MMPW Model Portfolio, Direct Equities Model, Entity Name, External ID.
  *     Missing any title → fatal for this file.
- *  4. Sheet1 row 1 = headers. Same helper for Code and External ID. Missing → fatal.
+ *  4. Sheet1 row 1 = headers. Same helper for Code, External ID, and Owner. Missing → fatal.
  *  5. buildHoldingsIndex(): walk Sheet1 from row 2 onward; for each row with External ID,
  *     read Code as a ticker: normalize, uppercase, skip if empty or length > 3 (treat as
- *     non–plain-equity / non-checkable). Append to a Map keyed by External ID (many rows
- *     per id allowed).
+ *     non–plain-equity / non-checkable). Also read Owner on that row. Append {ticker, owner}
+ *     to a Map keyed by External ID (many rows per id allowed).
  *  6. Walk Sheet2 from row 2 onward. Skip rows where MMPW Model Portfolio is not "premium"
  *     (case-insensitive).
  *  7. For each premium row:
@@ -101,6 +102,8 @@ const EXTRACT_SHEET2_TITLES = {
 const EXTRACT_SHEET1_TITLES = {
   code: "Code",
   externalId: "External ID",
+  /** Column H — owner of the holding row (distinct from Sheet2 Entity Name). */
+  sheet1Owner: "Owner",
 };
 
 const COL_BO = XLSX.utils.decode_col("BO");
@@ -137,6 +140,74 @@ const READ_OPTS = {
   cellFormula: false,
   sheetStubs: false,
 };
+
+/** Daily offending snapshot JSON (local calendar date in filename). */
+const OFFENDING_OUTPUT_DIR = "/mnt/data/portfolio-data/portfolios-with-off-menu-positions";
+const OFFENDING_SNAPSHOT_BASENAME = "offending-portfolios";
+const OFFENDING_SNAPSHOT_DATED_RE = new RegExp(
+  `^${OFFENDING_SNAPSHOT_BASENAME}-(\\d{4}-\\d{2}-\\d{2})\\.json$`
+);
+
+/** YYYY-MM-DD in the machine's local timezone (matches cron "today"). */
+function formatLocalYmd(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+/** Calendar "today minus 6 months", with day clamped to the target month's last day. */
+function subtractSixCalendarMonths(d) {
+  const y = d.getFullYear();
+  const m = d.getMonth();
+  const day = d.getDate();
+  let ty = y;
+  let tm = m - 6;
+  while (tm < 0) {
+    tm += 12;
+    ty -= 1;
+  }
+  const lastDay = new Date(ty, tm + 1, 0).getDate();
+  const td = Math.min(day, lastDay);
+  return new Date(ty, tm, td);
+}
+
+/**
+ * Removes dated `offending-portfolios-YYYY-MM-DD.json` files strictly older than 6 calendar months.
+ * Only names matching OFFENDING_SNAPSHOT_DATED_RE are considered. Prune errors are warnings only.
+ */
+async function pruneOldOffendingSnapshots(dir, today = new Date()) {
+  const cutoffYmd = formatLocalYmd(subtractSixCalendarMonths(today));
+  let names;
+  try {
+    names = await fs.readdir(dir);
+  } catch (err) {
+    console.error(
+      `[WARN] Could not read directory for retention prune (${dir}): ${err.message}`
+    );
+    return;
+  }
+  let removed = 0;
+  for (const name of names) {
+    const match = name.match(OFFENDING_SNAPSHOT_DATED_RE);
+    if (!match) continue;
+    const fileYmd = match[1];
+    if (fileYmd >= cutoffYmd) continue;
+    try {
+      await fs.unlink(path.join(dir, name));
+      removed += 1;
+    } catch (err) {
+      console.error(
+        `[WARN] Could not delete old snapshot "${name}": ${err.message}`
+      );
+    }
+  }
+  if (removed > 0) {
+    console.error(
+      `[INFO] Pruned ${removed} offending snapshot(s) older than 6 months under ${dir}`
+    );
+  }
+}
 
 function normalizeValue(value) {
   if (value === undefined || value === null) return "";
@@ -202,7 +273,8 @@ function resolveExtractColumns(sheet, headerRow1Based, keyToTitle) {
 }
 
 /**
- * Holdings rows start at firstDataRow0Based (row 2 => 1). Tickers from Code only.
+ * Holdings rows start at firstDataRow0Based (row 2 => 1). Tickers from Code;
+ * each row also carries Sheet1 Owner when present.
  */
 function buildHoldingsIndex(sheet, cols, firstDataRow0Based) {
   const index = new Map();
@@ -211,6 +283,7 @@ function buildHoldingsIndex(sheet, cols, firstDataRow0Based) {
   const range = XLSX.utils.decode_range(ref);
   const cExt = cols.externalId;
   const cCode = cols.code;
+  const cOwner = cols.sheet1Owner;
   for (let r = firstDataRow0Based; r <= range.e.r; r++) {
     const externalId = normalizeValue(
       sheet[XLSX.utils.encode_cell({ r, c: cExt })]?.v
@@ -220,8 +293,11 @@ function buildHoldingsIndex(sheet, cols, firstDataRow0Based) {
       sheet[XLSX.utils.encode_cell({ r, c: cCode })]?.v
     );
     if (!ticker || ticker.length > 3) continue;
+    const owner = normalizeValue(
+      sheet[XLSX.utils.encode_cell({ r, c: cOwner })]?.v
+    );
     if (!index.has(externalId)) index.set(externalId, []);
-    index.get(externalId).push(ticker);
+    index.get(externalId).push({ ticker, owner });
   }
   return index;
 }
@@ -517,6 +593,18 @@ function getSheet1Name(workbook) {
   return findSheetByName(workbook, SHEET_1_NAME);
 }
 
+function detectMenuFromModelCell(modelCellLower) {
+  const s = modelCellLower.trim();
+  if (!s) return { menuKey: "agnostic", menuLabel: "Agnostic" };
+  if (s.includes("sustain")) {
+    return { menuKey: "sustainable", menuLabel: "Sustainability" };
+  }
+  if (s.includes("ex gambling") || s.includes("ex-gambling")) {
+    return { menuKey: "exGambling", menuLabel: "Ex Gambling" };
+  }
+  return { menuKey: "agnostic", menuLabel: "Agnostic" };
+}
+
 function evaluateWorkbook(workbookPath, workbook, menus) {
   const sheet2Name = getSheet2Name(workbook);
   if (!sheet2Name) {
@@ -602,16 +690,24 @@ function evaluateWorkbook(workbookPath, workbook, menus) {
   const dataStartR0 = EXTRACT_HEADER_ROW_1BASED;
 
   for (let r = dataStartR0; r <= range.e.r; r++) {
-    const premiumCell = normalizeValue(
+    const premiumValue = normalizeValue(
       sheet2[XLSX.utils.encode_cell({ r, c: s2c.premium })]?.v
-    ).toLowerCase();
-    if (premiumCell !== "premium") continue;
+    );
+    const premiumCellLower = premiumValue.toLowerCase();
+    if (premiumCellLower !== "premium") continue;
 
-    const modelRaw = normalizeValue(
+    const modelValue = normalizeValue(
       sheet2[XLSX.utils.encode_cell({ r, c: s2c.model })]?.v
-    ).toLowerCase();
-    const menuType = modelRaw === "sustainable" ? "sustainable" : "agnostic";
-    const menuSet = menuType === "sustainable" ? menus.sustainable : menus.agnostic;
+    );
+    const modelRawLower = modelValue.toLowerCase();
+    const detected = detectMenuFromModelCell(modelRawLower);
+    const menuType = detected.menuKey;
+    const menuLabel = detected.menuLabel;
+    const menuSetRaw = menus[menuType] ?? menus.agnostic;
+    const menuSet =
+      menuType === "exGambling" && menuSetRaw.size === 0
+        ? menus.agnostic
+        : menuSetRaw;
     const externalId = normalizeValue(
       sheet2[XLSX.utils.encode_cell({ r, c: s2c.externalId })]?.v
     );
@@ -630,8 +726,8 @@ function evaluateWorkbook(workbookPath, workbook, menus) {
     }
 
     result.checked += 1;
-    const tickers = holdingsIndex.get(externalId) ?? [];
-    if (tickers.length === 0) {
+    const holdingsRows = holdingsIndex.get(externalId) ?? [];
+    if (holdingsRows.length === 0) {
       result.warnings.push(
         `No eligible tickers in "${holdingsName}" Code column for External ID "${externalId}" (${portfolioName}).`
       );
@@ -639,11 +735,18 @@ function evaluateWorkbook(workbookPath, workbook, menus) {
       continue;
     }
 
-    const unique = [...new Set(tickers)];
+    const unique = [...new Set(holdingsRows.map((h) => h.ticker))];
     const offenders = unique.filter(
       (t) => !menuSet.has(t) && !WHITELISTED_TICKERS.has(t)
     );
     if (offenders.length > 0) {
+      const offendersWithOwner = offenders.map((ticker) => {
+        const row = holdingsRows.find((h) => h.ticker === ticker);
+        return {
+          ticker,
+          sheet1Owner: row?.owner ?? "",
+        };
+      });
       result.flagged.push({
         row: r + 1,
         portfolioName,
@@ -651,7 +754,10 @@ function evaluateWorkbook(workbookPath, workbook, menus) {
         externalId,
         menuType,
         tickersChecked: unique,
-        offenders,
+        offenders: offendersWithOwner,
+        premiumValue,
+        modelValue,
+        menuLabel,
       });
     } else {
       result.compliant += 1;
@@ -677,8 +783,9 @@ function printResult(result) {
   }
 
   for (const item of result.flagged) {
+    const offenderCodes = item.offenders.map((o) => o.ticker).join(",");
     console.error(
-      `  [FLAG] portfolio=${item.portfolioName} row=${item.row} owner=${JSON.stringify(item.owner)} externalId=${item.externalId} menu=${item.menuType} offenders=${item.offenders.join(",")}`
+      `  [FLAG] portfolio=${item.portfolioName} row=${item.row} owner=${JSON.stringify(item.owner)} externalId=${item.externalId} menu=${item.menuType} offenders=${offenderCodes}`
     );
   }
 }
@@ -728,6 +835,8 @@ async function main() {
     fatalFiles: 0,
   };
 
+  const offendingRows = [];
+
   for (const filePath of files) {
     aggregate.files += 1;
     let workbook;
@@ -758,7 +867,47 @@ async function main() {
     aggregate.checked += result.checked;
     aggregate.compliant += result.compliant;
     aggregate.flagged += result.flagged.length;
+
+    for (const item of result.flagged) {
+      for (const o of item.offenders) {
+        offendingRows.push({
+          filename: path.basename(result.file),
+          mmpwModelPortfolio: item.premiumValue ?? "",
+          directEquitiesModel: item.modelValue ?? "",
+          menu: item.menuLabel ?? item.menuType ?? "",
+          owner: o.sheet1Owner ?? "",
+          offender: o.ticker,
+        });
+      }
+    }
   }
+
+  const generatedAt = new Date();
+  const runDate = formatLocalYmd(generatedAt);
+  const snapshot = {
+    runDate,
+    summary: {
+      // Instant file was written (ISO 8601 UTC, e.g. ...Z); convert to local in consumers.
+      generated_at: generatedAt.toISOString(),
+      files: aggregate.files,
+      premium_portfolios_checked: aggregate.checked,
+      compliant: aggregate.compliant,
+      flagged: aggregate.flagged,
+      fatal_files: aggregate.fatalFiles,
+      offender_rows: offendingRows.length,
+    },
+    rows: offendingRows,
+  };
+  await fs.mkdir(OFFENDING_OUTPUT_DIR, { recursive: true });
+  const outJsonPath = path.join(
+    OFFENDING_OUTPUT_DIR,
+    `${OFFENDING_SNAPSHOT_BASENAME}-${runDate}.json`
+  );
+  await fs.writeFile(outJsonPath, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+  console.error(
+    `[INFO] Wrote offending portfolios snapshot (${offendingRows.length} row(s)) to ${outJsonPath}`
+  );
+  await pruneOldOffendingSnapshots(OFFENDING_OUTPUT_DIR);
 
   console.error(
     `\n[SUMMARY]\n  files: ${aggregate.files}\n  premium_portfolios_checked: ${aggregate.checked}\n  compliant: ${aggregate.compliant}\n  flagged: ${aggregate.flagged}\n  fatal_files: ${aggregate.fatalFiles}`

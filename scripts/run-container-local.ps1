@@ -32,7 +32,7 @@ Write-Host "[GITHUB] Token: $tokenStatus" -ForegroundColor Green
 
 # Run the container
 docker run -d `
-  --mount type=bind,source=c:/Users/AdrianSobotta/Data/portfolio-data-extractor,target=/mnt/data/ `
+  --mount type=bind,source="C:/Users/AdrianSobotta/Data/portfolio-data",target=/mnt/data/portfolio-data `
   --mount type=bind,source=c:/Users/AdrianSobotta/Development,target=/mnt/windows-development `
   --mount type=bind,source="C:/Users/AdrianSobotta/OneDrive - MINCHIN MOORE PRIVATE WEALTH PTY LTD/Information Technology - processes",target=/mnt/processes `
   --hostname portfolio-extract-data-checker `

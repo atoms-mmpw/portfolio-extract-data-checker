@@ -33,6 +33,7 @@ Write-Host "[GITHUB] Token: $tokenStatus" -ForegroundColor Green
 # Run the container
 docker run -d `
   --mount type=bind,source="C:/Users/svc-general-purpose/OneDrive - MINCHIN MOORE PRIVATE WEALTH PTY LTD/Information Technology - processes",target=/mnt/processes `
+  --mount type=bind,source="C:\Users\svc-general-purpose\Data\portfolio-data",target=/mnt/data/portfolio-data `
   --hostname portfolio-extract-data-checker `
   --name portfolio-extract-data-checker `
   -e GIT_EMAIL="$GIT_EMAIL" `
