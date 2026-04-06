@@ -2,7 +2,7 @@
   "name": "portfolio-menu-compliance",
   "version": "1.0.0",
   "private": true,
-  "description": "Premium menu compliance checker for Xplan portfolio extracts. Run: npm run check-premium-menu -- <extract.xlsx|folder>",
+  "description": "Premium menu compliance checker for Xplan portfolio extracts. Env: PREMIUM_MENU_WORKERS, PREMIUM_MENU_PROGRESS_EVERY. Run: npm run check-premium-menu or npm run check-premium-menu -- <path>",
   "type": "module",
   "scripts": {
     "check-premium-menu": "node check-premium-menu-compliance.js"

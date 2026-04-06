@@ -8,16 +8,21 @@
  * ---------------------------------------------------------------------------
  * Phase 1 — Startup (main)
  * ---------------------------------------------------------------------------
- *  1. Read argv[1] as input path (one .xlsx/.xlsm file or a directory of them).
+ *  1. Input path: if argv[2] is set, use it (one .xlsx/.xlsm or a directory of them via
+ *     listInputFiles). If omitted, use DEFAULT_EXTRACTS_ROOT: among immediate subdirectories
+ *     named Run rebal extract template-YYYY-MM-DD-HHmmss, pick the newest by that embedded
+ *     date/time and collect workbooks only from that folder (listWorkbooksFromDefaultExtractsRoot).
  *  2. loadMenus() — see Phase 2. On failure, print [FATAL] and exit 1.
  *  3. Log [INFO] with menu counts; printMenuTables() writes agnostic + sustainable tables
  *     to stdout, and the ex-gambling table if present (that third menu is never used in
  *     compliance logic — display only).
- *  4. listInputFiles() — resolve path to a sorted list of workbook files.
- *  5. If none found, [FATAL] and exit 1.
- *  6. For each file: read with SheetJS, evaluateWorkbook() (Phase 3), printResult().
- *  7. Write dated JSON snapshot (summary + offending rows) under OFFENDING_OUTPUT_DIR; prune
- *     snapshots older than 6 months. Print [SUMMARY] totals. Exit 1 if any file had a fatal
+ *  4. Resolve workbook file list (see step 1). If none found, [FATAL] and exit 1.
+ *  5. Evaluate each file in parallel via worker threads (concurrency from PREMIUM_MENU_WORKERS
+ *     or CPU count); stderr progress while running; then printResult() in original file order.
+ *  6. Write JSON snapshot under OFFENDING_OUTPUT_DIR: summary.runDate and filename
+ *     offending-portfolios-{runDate}.json use the extract run folder date when derivable from
+ *     Run rebal extract template-* (else today's local date); summary.generated_at is write time.
+ *     Prune snapshots older than 6 months. Print [SUMMARY] totals. Exit 1 if any file had a fatal
  *     error or any [FLAG] rows; exit 0 only when every file succeeded and no violations.
  *
  * ---------------------------------------------------------------------------
@@ -48,11 +53,12 @@
  *  3. Sheet2 row 1 = headers. resolveExtractColumns() maps titles (case-insensitive) to
  *     column indices: MMPW Model Portfolio, Direct Equities Model, Entity Name, External ID.
  *     Missing any title → fatal for this file.
- *  4. Sheet1 row 1 = headers. Same helper for Code, External ID, and Owner. Missing → fatal.
+ *  4. Sheet1 row 1 = headers. Same helper for Code, Entity ID, External ID, and Owner.
+ *     Missing any title → fatal.
  *  5. buildHoldingsIndex(): walk Sheet1 from row 2 onward; for each row with External ID,
  *     read Code as a ticker: normalize, uppercase, skip if empty or length > 3 (treat as
- *     non–plain-equity / non-checkable). Also read Owner on that row. Append {ticker, owner}
- *     to a Map keyed by External ID (many rows per id allowed).
+ *     non–plain-equity / non-checkable). Also read Entity ID and Owner on that row. Append
+ *     {ticker, owner, entityId} to a Map keyed by External ID (many rows per id allowed).
  *  6. Walk Sheet2 from row 2 onward. Skip rows where MMPW Model Portfolio is not "premium"
  *     (case-insensitive).
  *  7. For each premium row:
@@ -72,77 +78,44 @@
  *  - Menu tables (Phase 2) go to stdout so you can pipe or separate them if needed.
  *
  * Usage:
- *   node check-premium-menu-compliance.js <extract.xlsx|folder>
- *   npm run check-premium-menu -- <extract.xlsx|folder>
+ *   node check-premium-menu-compliance.js
+ *   node check-premium-menu-compliance.js [<extract.xlsx|folder>]
+ *   npm run check-premium-menu -- [<extract.xlsx|folder>]
+ *
+ * With no args, workbooks are taken from the single newest Run rebal extract template-* folder
+ * under DEFAULT_EXTRACTS_ROOT.
+ *
+ * Optional: PREMIUM_MENU_WORKERS=max concurrent worker threads (default 4, capped by CPU count).
+ * Optional: PREMIUM_MENU_PROGRESS_EVERY=log every N completed workbooks (default scales with total).
  */
 
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
-import * as XLSX from "xlsx";
+import { Worker } from "node:worker_threads";
+import { fileURLToPath } from "node:url";
 
-const TEMPLATE_PATH =
-  "./templates/260223 Portfolio Rebalance - Template (New Debt Investments Model).xlsm";
+import {
+  loadMenus,
+  menusToSerializable,
+  printMenuTables,
+  printResult,
+} from "./premium-menu-compliance-core.js";
 
-const SHEET_2_NAME = "Sheet2";
-const SHEET_1_NAME = "Sheet1";
-/** Template workbook: prefer this sheet when loading menus (extracts use Sheet1 only). */
-const TARGET_SHEET_NAME = "Target";
+const WORKER_URL = new URL(
+  "./premium-menu-compliance-worker.js",
+  import.meta.url
+);
 
-const EXTRACT_HEADER_ROW_1BASED = 1;
+/** When no CLI path is given: newest subdir matching RUN_EXTRACT_DIR_RE is used. */
+const DEFAULT_EXTRACTS_ROOT =
+  "/mnt/processes/portfolio-rebalance/extracts";
+/** Group 1 = YYYY-MM-DD (filename + summary.runDate); group 2 = HHmmss. Sort key = `${g1}-${g2}`. */
+const RUN_EXTRACT_DIR_RE =
+  /^Run rebal extract template-(\d{4}-\d{2}-\d{2})-(\d{6})$/;
 
-/** Sheet2 column titles on row 1 (keys are internal ids). */
-const EXTRACT_SHEET2_TITLES = {
-  premium: "MMPW Model Portfolio",
-  model: "Direct Equities Model",
-  owner: "Entity Name",
-  externalId: "External ID",
-};
-
-/** Sheet1 holdings column titles on row 1. */
-const EXTRACT_SHEET1_TITLES = {
-  code: "Code",
-  externalId: "External ID",
-  /** Column H — owner of the holding row (distinct from Sheet2 Entity Name). */
-  sheet1Owner: "Owner",
-};
-
-const COL_BO = XLSX.utils.decode_col("BO");
-const COL_BQ = XLSX.utils.decode_col("BQ");
-
-/** Exact BO header for the agnostic (30-style) menu — must not substring-match sustainability. */
-const HEADER_AGNOSTIC = "Industry Equal Weight";
-
-/** Any of these BO values (after trim) identify the sustainable table. */
-const HEADER_SUSTAINABLE_ALIASES = [
-  "Industry Equal Weight - Sustainability",
-  "Industry Equal Weight — Sustainability",
-];
-
-/** Optional section; loaded for console display only. */
-const HEADER_EX_GAMBLING_ALIASES = [
-  "Industry Equal Weight - ex Gambling",
-  "Industry Equal Weight — ex Gambling",
-];
-
-const MIN_MENU_TICKERS = 20;
-
-/**
- * Tickers that should be ignored for compliance checks even if they are holdings
- * and not present in the valid menu.
- */
-const WHITELISTED_TICKERS = new Set(["MVE", "VIF"]);
-
-const READ_OPTS = {
-  type: "buffer",
-  cellDates: false,
-  cellStyles: false,
-  cellHTML: false,
-  cellFormula: false,
-  sheetStubs: false,
-};
-
-/** Daily offending snapshot JSON (local calendar date in filename). */
-const OFFENDING_OUTPUT_DIR = "/mnt/data/portfolio-data/portfolios-with-off-menu-positions";
+const OFFENDING_OUTPUT_DIR =
+  "/mnt/data/portfolio-data/portfolios-with-off-menu-positions";
 const OFFENDING_SNAPSHOT_BASENAME = "offending-portfolios";
 const OFFENDING_SNAPSHOT_DATED_RE = new RegExp(
   `^${OFFENDING_SNAPSHOT_BASENAME}-(\\d{4}-\\d{2}-\\d{2})\\.json$`
@@ -209,354 +182,12 @@ async function pruneOldOffendingSnapshots(dir, today = new Date()) {
   }
 }
 
-function normalizeValue(value) {
-  if (value === undefined || value === null) return "";
-  return String(value).trim();
-}
-
-function normalizeTicker(value) {
-  return normalizeValue(value).toUpperCase();
-}
-
-function cellValue(sheet, row1Based, col0Based) {
-  const addr = XLSX.utils.encode_cell({ r: row1Based - 1, c: col0Based });
-  return sheet[addr]?.v;
-}
-
-/**
- * Map row-1 header titles to 0-based column indices (case-insensitive after trim).
- * @param {Record<string, string>} keyToTitle
- * @returns {{ ok: true, cols: Record<string, number> } | { ok: false, missing: string[] }}
- */
-function resolveExtractColumns(sheet, headerRow1Based, keyToTitle) {
-  const ref = sheet["!ref"];
-  if (!ref) {
-    return { ok: false, missing: ["(sheet has no used range)"] };
-  }
-  const range = XLSX.utils.decode_range(ref);
-  const headerR0 = headerRow1Based - 1;
-  if (headerR0 < range.s.r || headerR0 > range.e.r) {
-    return {
-      ok: false,
-      missing: [`(header row ${headerRow1Based} outside sheet range)`],
-    };
-  }
-
-  const titleNormToKey = new Map();
-  for (const [key, title] of Object.entries(keyToTitle)) {
-    titleNormToKey.set(normalizeValue(title).toLowerCase(), key);
-  }
-
-  const cols = {};
-  for (let c = range.s.c; c <= range.e.c; c++) {
-    const cellKey = normalizeValue(
-      cellValue(sheet, headerRow1Based, c)
-    ).toLowerCase();
-    if (!cellKey) continue;
-    const logicalKey = titleNormToKey.get(cellKey);
-    if (logicalKey !== undefined && cols[logicalKey] === undefined) {
-      cols[logicalKey] = c;
-    }
-  }
-
-  const missing = [];
-  for (const [key, title] of Object.entries(keyToTitle)) {
-    if (cols[key] === undefined) {
-      missing.push(title);
-    }
-  }
-
-  if (missing.length > 0) {
-    return { ok: false, missing };
-  }
-  return { ok: true, cols };
-}
-
-/**
- * Holdings rows start at firstDataRow0Based (row 2 => 1). Tickers from Code;
- * each row also carries Sheet1 Owner when present.
- */
-function buildHoldingsIndex(sheet, cols, firstDataRow0Based) {
-  const index = new Map();
-  const ref = sheet["!ref"];
-  if (!ref) return index;
-  const range = XLSX.utils.decode_range(ref);
-  const cExt = cols.externalId;
-  const cCode = cols.code;
-  const cOwner = cols.sheet1Owner;
-  for (let r = firstDataRow0Based; r <= range.e.r; r++) {
-    const externalId = normalizeValue(
-      sheet[XLSX.utils.encode_cell({ r, c: cExt })]?.v
-    );
-    if (!externalId) continue;
-    const ticker = normalizeTicker(
-      sheet[XLSX.utils.encode_cell({ r, c: cCode })]?.v
-    );
-    if (!ticker || ticker.length > 3) continue;
-    const owner = normalizeValue(
-      sheet[XLSX.utils.encode_cell({ r, c: cOwner })]?.v
-    );
-    if (!index.has(externalId)) index.set(externalId, []);
-    index.get(externalId).push({ ticker, owner });
-  }
-  return index;
-}
-
-function getSheetRowRange1Based(sheet) {
-  const ref = sheet["!ref"];
-  if (!ref) return null;
-  const d = XLSX.utils.decode_range(ref);
-  return { min: d.s.r + 1, max: d.e.r + 1 };
-}
-
-/** Tickers from row start while BQ is non-empty (stops at padded rows with blank BQ). */
-function collectTickerBlockFromBq(sheet, startRow1Based, rowMax1Based) {
-  const tickers = [];
-  for (let r = startRow1Based; r <= rowMax1Based; r++) {
-    const ticker = normalizeTicker(cellValue(sheet, r, COL_BQ));
-    if (!ticker) break;
-    tickers.push(ticker);
-  }
-  return tickers;
-}
-
-/**
- * Scan BO for known headers; read each table until blank BQ.
- * @returns {{ bounds: {min:number,max:number}|null, rows: {agnostic:number|null, sustainable:number|null, exGambling:number|null}, agnostic: string[], sustainable: string[], exGambling: string[], sustainableHeaderLabel: string|null, exGamblingHeaderLabel: string|null }}
- */
-function scanMenusOnSheet(sheet) {
-  const bounds = getSheetRowRange1Based(sheet);
-  const empty = {
-    bounds,
-    rows: { agnostic: null, sustainable: null, exGambling: null },
-    agnostic: [],
-    sustainable: [],
-    exGambling: [],
-    sustainableHeaderLabel: null,
-    exGamblingHeaderLabel: null,
-  };
-  if (!bounds) return empty;
-
-  const boText = (r) => normalizeValue(cellValue(sheet, r, COL_BO));
-
-  for (let r = bounds.min; r <= bounds.max; r++) {
-    const bo = boText(r);
-    if (bo === HEADER_AGNOSTIC && empty.rows.agnostic === null) {
-      empty.rows.agnostic = r;
-    }
-    if (empty.rows.sustainable === null) {
-      const hit = HEADER_SUSTAINABLE_ALIASES.find((a) => bo === a);
-      if (hit) {
-        empty.rows.sustainable = r;
-        empty.sustainableHeaderLabel = hit;
-      }
-    }
-    if (empty.rows.exGambling === null) {
-      const hitG = HEADER_EX_GAMBLING_ALIASES.find((a) => bo === a);
-      if (hitG) {
-        empty.rows.exGambling = r;
-        empty.exGamblingHeaderLabel = hitG;
-      }
-    }
-  }
-
-  if (empty.rows.agnostic != null) {
-    empty.agnostic = collectTickerBlockFromBq(
-      sheet,
-      empty.rows.agnostic + 1,
-      bounds.max
-    );
-  }
-  if (empty.rows.sustainable != null) {
-    empty.sustainable = collectTickerBlockFromBq(
-      sheet,
-      empty.rows.sustainable + 1,
-      bounds.max
-    );
-  }
-  if (empty.rows.exGambling != null) {
-    empty.exGambling = collectTickerBlockFromBq(
-      sheet,
-      empty.rows.exGambling + 1,
-      bounds.max
-    );
-  }
-
-  return empty;
-}
-
-function isMenuScanValid(scan) {
-  return (
-    scan.bounds != null &&
-    scan.rows.agnostic != null &&
-    scan.rows.sustainable != null &&
-    scan.agnostic.length >= MIN_MENU_TICKERS &&
-    scan.sustainable.length >= MIN_MENU_TICKERS
-  );
-}
-
-function describeMenuScanFailure(scan) {
-  const parts = [];
-  if (!scan.bounds) parts.push("sheet has no used range (!ref)");
-  if (scan.rows.agnostic == null) {
-    parts.push(`missing BO header "${HEADER_AGNOSTIC}"`);
-  } else if (scan.agnostic.length < MIN_MENU_TICKERS) {
-    parts.push(
-      `agnostic menu: ${scan.agnostic.length} tickers (need >= ${MIN_MENU_TICKERS})`
-    );
-  }
-  if (scan.rows.sustainable == null) {
-    parts.push(
-      `missing sustainable BO header (try one of: ${HEADER_SUSTAINABLE_ALIASES.join(" | ")})`
-    );
-  } else if (scan.sustainable.length < MIN_MENU_TICKERS) {
-    parts.push(
-      `sustainable menu: ${scan.sustainable.length} tickers (need >= ${MIN_MENU_TICKERS})`
-    );
-  }
-  return parts.join("; ");
-}
-
-function pickTemplateSheet(workbook) {
-  const targetName = findSheetByName(workbook, TARGET_SHEET_NAME);
-  const names = targetName
-    ? [targetName, ...workbook.SheetNames.filter((n) => n !== targetName)]
-    : [...workbook.SheetNames];
-
-  for (const name of names) {
-    const sheet = workbook.Sheets[name];
-    const scan = scanMenusOnSheet(sheet);
-    if (isMenuScanValid(scan)) {
-      return { sheetName: name, sheet, scan };
-    }
-  }
-  return null;
-}
-
-async function loadMenus() {
-  const resolvedTemplate = path.resolve(TEMPLATE_PATH);
-  let workbook;
-  try {
-    const buf = await fs.readFile(resolvedTemplate);
-    workbook = XLSX.read(buf, READ_OPTS);
-  } catch (err) {
-    throw new Error(
-      `Failed to read template "${resolvedTemplate}": ${err.message}`
-    );
-  }
-
-  const picked = pickTemplateSheet(workbook);
-  if (!picked) {
-    const targetName = findSheetByName(workbook, TARGET_SHEET_NAME);
-    const probeName = targetName ?? workbook.SheetNames[0];
-    const probeSheet = probeName ? workbook.Sheets[probeName] : null;
-    const scan = probeSheet ? scanMenusOnSheet(probeSheet) : null;
-    const detail = scan
-      ? describeMenuScanFailure(scan)
-      : "no workbook sheets";
-    throw new Error(
-      `Could not load agnostic and sustainable menus from template (${detail}). Tried sheet "${probeName ?? "n/a"}".`
-    );
-  }
-
-  const { scan, sheetName } = picked;
-
-  if (scan.rows.exGambling == null) {
-    console.error(
-      '[WARN] Template: BO header "Industry Equal Weight - ex Gambling" (or em-dash variant) not found; skipping ex Gambling menu display.'
-    );
-  } else if (scan.exGambling.length === 0) {
-    console.error(
-      "[WARN] Template: ex Gambling header found but no tickers before blank BQ."
-    );
-  }
-
-  const agnostic = new Set(scan.agnostic);
-  const sustainable = new Set(scan.sustainable);
-  const exGambling = new Set(scan.exGambling);
-
-  const agnosticOrder = [...scan.agnostic];
-  const sustainableOrder = [...scan.sustainable];
-  const exGamblingOrder = [...scan.exGambling];
-
-  if (agnostic.size < scan.agnostic.length) {
-    console.error(
-      `[WARN] Agnostic menu contains duplicate tickers (${scan.agnostic.length} rows, ${agnostic.size} unique).`
-    );
-  }
-  if (sustainable.size < scan.sustainable.length) {
-    console.error(
-      `[WARN] Sustainable menu contains duplicate tickers (${scan.sustainable.length} rows, ${sustainable.size} unique).`
-    );
-  }
-
-  return {
-    agnostic,
-    sustainable,
-    exGambling,
-    agnosticOrder,
-    sustainableOrder,
-    exGamblingOrder,
-    sourceSheet: sheetName,
-    menuMeta: {
-      agnosticHeaderRow: scan.rows.agnostic,
-      sustainableHeaderRow: scan.rows.sustainable,
-      exGamblingHeaderRow: scan.rows.exGambling,
-      agnosticHeaderLabel: HEADER_AGNOSTIC,
-      sustainableHeaderLabel: scan.sustainableHeaderLabel,
-      exGamblingHeaderLabel: scan.exGamblingHeaderLabel,
-    },
-  };
-}
-
-/** Pretty-print template menus to stdout before validation runs. */
-function printMenuTables(menus) {
-  const line = (ch, len = 62) => ch.repeat(len);
-  const printBlock = (title, rangeLabel, tickers) => {
-    const idxW = Math.max(2, String(Math.max(1, tickers.length)).length);
-    const tickerW = Math.max(
-      6,
-      tickers.length ? Math.max(...tickers.map((t) => t.length)) : 6
-    );
-    console.log("");
-    console.log(line("═"));
-    console.log(`  ${title}`);
-    console.log(`  ${rangeLabel}`);
-    console.log(line("═"));
-    console.log(`  ${"#".padEnd(idxW)}  ${"Ticker".padEnd(tickerW)}`);
-    console.log(`  ${"─".repeat(idxW)}  ${"─".repeat(tickerW)}`);
-    tickers.forEach((t, i) => {
-      console.log(`  ${String(i + 1).padEnd(idxW)}  ${t.padEnd(tickerW)}`);
-    });
-    console.log(line("═"));
-  };
-
-  const m = menus.menuMeta;
-  const sh = menus.sourceSheet;
-
-  printBlock(
-    `Agnostic menu (${menus.agnosticOrder.length} stocks)`,
-    `${sh}!row ${m.agnosticHeaderRow} BO "${m.agnosticHeaderLabel}" → BQ until blank`,
-    menus.agnosticOrder
-  );
-  printBlock(
-    `Sustainable menu (${menus.sustainableOrder.length} stocks)`,
-    `${sh}!row ${m.sustainableHeaderRow} BO "${m.sustainableHeaderLabel}" → BQ until blank`,
-    menus.sustainableOrder
-  );
-  if (menus.exGamblingOrder.length > 0) {
-    printBlock(
-      `Ex-gambling menu (${menus.exGamblingOrder.length} stocks) — NOT used by any check; listed here for your reference only`,
-      `${sh}!row ${m.exGamblingHeaderRow} BO "${m.exGamblingHeaderLabel}" → BQ until blank`,
-      menus.exGamblingOrder
-    );
-  }
-  console.log("");
-}
-
 function isWorkbookFile(name) {
   const lower = name.toLowerCase();
-  return !name.startsWith("~$") && (lower.endsWith(".xlsx") || lower.endsWith(".xlsm"));
+  return (
+    !name.startsWith("~$") &&
+    (lower.endsWith(".xlsx") || lower.endsWith(".xlsm"))
+  );
 }
 
 async function listInputFiles(inputPath) {
@@ -573,231 +204,219 @@ async function listInputFiles(inputPath) {
     .sort((a, b) => a.localeCompare(b));
 }
 
-function findSheetByName(workbook, preferredName) {
-  const exact = workbook.SheetNames.find((n) => n === preferredName);
-  if (exact) return exact;
-  const ci = workbook.SheetNames.find(
-    (n) => n.toLowerCase() === preferredName.toLowerCase()
-  );
-  return ci ?? null;
+/**
+ * Stable order for JSON rows / UIs: Entity–portfolio label, Entity ID, External ID, then ticker.
+ */
+function sortOffendingRowsForSnapshot(rows) {
+  const collator = new Intl.Collator(undefined, {
+    sensitivity: "base",
+    numeric: true,
+  });
+  const entityPortfolioKey = (r) =>
+    (r.entityName || r.portfolioName || r.owner || "").trim();
+  rows.sort((a, b) => {
+    let c = collator.compare(entityPortfolioKey(a), entityPortfolioKey(b));
+    if (c !== 0) return c;
+    c = collator.compare(String(a.entityId ?? ""), String(b.entityId ?? ""));
+    if (c !== 0) return c;
+    c = collator.compare(String(a.externalId ?? ""), String(b.externalId ?? ""));
+    if (c !== 0) return c;
+    return collator.compare(String(a.offender ?? ""), String(b.offender ?? ""));
+  });
 }
 
-function getSheet2Name(workbook) {
-  const named = findSheetByName(workbook, SHEET_2_NAME);
-  if (named) return named;
-  // Fallback: "sheet two" by position.
-  return workbook.SheetNames[1] ?? null;
+function runFolderDateYmd(folderName) {
+  const m = folderName.match(RUN_EXTRACT_DIR_RE);
+  return m ? m[1] : null;
 }
 
-function getSheet1Name(workbook) {
-  return findSheetByName(workbook, SHEET_1_NAME);
+async function resolveSnapshotRunDateYmd({
+  useDefaultExtracts,
+  selectedRunFolder,
+  explicitPath,
+}) {
+  if (useDefaultExtracts && selectedRunFolder) {
+    const d = runFolderDateYmd(selectedRunFolder);
+    if (d) return d;
+  }
+  if (!useDefaultExtracts && explicitPath) {
+    const resolved = path.resolve(explicitPath);
+    try {
+      const stats = await fs.stat(resolved);
+      let cur = stats.isFile() ? path.dirname(resolved) : resolved;
+      const seen = new Set();
+      while (cur && !seen.has(cur)) {
+        seen.add(cur);
+        const d = runFolderDateYmd(path.basename(cur));
+        if (d) return d;
+        const parent = path.dirname(cur);
+        if (parent === cur) break;
+        cur = parent;
+      }
+    } catch {
+      /* fall through to today */
+    }
+  }
+  return formatLocalYmd(new Date());
 }
 
-function detectMenuFromModelCell(modelCellLower) {
-  const s = modelCellLower.trim();
-  if (!s) return { menuKey: "agnostic", menuLabel: "Agnostic" };
-  if (s.includes("sustain")) {
-    return { menuKey: "sustainable", menuLabel: "Sustainability" };
+/**
+ * Among immediate subdirectories of root matching RUN_EXTRACT_DIR_RE, pick the newest by
+ * date/time in the folder name; collect .xlsx/.xlsm from that folder only (non-recursive).
+ */
+async function listWorkbooksFromDefaultExtractsRoot(root) {
+  const resolved = path.resolve(root);
+  const stats = await fs.stat(resolved);
+  if (!stats.isDirectory()) {
+    throw new Error(`Default extracts path is not a directory: ${resolved}`);
   }
-  if (s.includes("ex gambling") || s.includes("ex-gambling")) {
-    return { menuKey: "exGambling", menuLabel: "Ex Gambling" };
+  const entries = await fs.readdir(resolved, { withFileTypes: true });
+  const candidates = [];
+  for (const ent of entries) {
+    if (!ent.isDirectory()) continue;
+    const m = ent.name.match(RUN_EXTRACT_DIR_RE);
+    if (!m) continue;
+    candidates.push({ name: ent.name, sortKey: `${m[1]}-${m[2]}` });
   }
-  return { menuKey: "agnostic", menuLabel: "Agnostic" };
-}
-
-function evaluateWorkbook(workbookPath, workbook, menus) {
-  const sheet2Name = getSheet2Name(workbook);
-  if (!sheet2Name) {
+  if (candidates.length === 0) {
     return {
-      file: workbookPath,
-      fatal: `Missing "${SHEET_2_NAME}" sheet`,
-      checked: 0,
-      compliant: 0,
-      flagged: [],
-      warnings: [],
+      files: [],
+      runFolderCount: 0,
+      selectedRunFolder: null,
     };
   }
-  const holdingsName = getSheet1Name(workbook);
-  if (!holdingsName) {
-    return {
-      file: workbookPath,
-      fatal: `Missing "${SHEET_1_NAME}" sheet (Xplan holdings)`,
-      checked: 0,
-      compliant: 0,
-      flagged: [],
-      warnings: [],
-    };
-  }
-
-  const sheet2 = workbook.Sheets[sheet2Name];
-  const holdings = workbook.Sheets[holdingsName];
-
-  const s2colsRes = resolveExtractColumns(
-    sheet2,
-    EXTRACT_HEADER_ROW_1BASED,
-    EXTRACT_SHEET2_TITLES
-  );
-  if (!s2colsRes.ok) {
-    return {
-      file: workbookPath,
-      fatal: `Sheet "${sheet2Name}" row ${EXTRACT_HEADER_ROW_1BASED}: missing column title(s): ${s2colsRes.missing.join(", ")}`,
-      checked: 0,
-      compliant: 0,
-      flagged: [],
-      warnings: [],
-    };
-  }
-
-  const s1colsRes = resolveExtractColumns(
-    holdings,
-    EXTRACT_HEADER_ROW_1BASED,
-    EXTRACT_SHEET1_TITLES
-  );
-  if (!s1colsRes.ok) {
-    return {
-      file: workbookPath,
-      fatal: `Sheet "${holdingsName}" row ${EXTRACT_HEADER_ROW_1BASED}: missing column title(s): ${s1colsRes.missing.join(", ")}`,
-      checked: 0,
-      compliant: 0,
-      flagged: [],
-      warnings: [],
-    };
-  }
-
-  const s2c = s2colsRes.cols;
-  const h1c = s1colsRes.cols;
-  const holdingsIndex = buildHoldingsIndex(
-    holdings,
-    h1c,
-    EXTRACT_HEADER_ROW_1BASED
-  );
-
-  const result = {
-    file: workbookPath,
-    fatal: null,
-    checked: 0,
-    compliant: 0,
-    flagged: [],
-    warnings: [],
+  candidates.sort((a, b) => a.sortKey.localeCompare(b.sortKey));
+  const newest = candidates[candidates.length - 1];
+  const subDir = path.join(resolved, newest.name);
+  const inner = await fs.readdir(subDir);
+  const files = inner
+    .filter(isWorkbookFile)
+    .map((name) => path.join(subDir, name))
+    .sort((a, b) => a.localeCompare(b));
+  return {
+    files,
+    runFolderCount: candidates.length,
+    selectedRunFolder: newest.name,
   };
-
-  const ref = sheet2["!ref"];
-  if (!ref) {
-    result.warnings.push(`Sheet "${sheet2Name}" has no data range.`);
-    return result;
-  }
-  const range = XLSX.utils.decode_range(ref);
-  const dataStartR0 = EXTRACT_HEADER_ROW_1BASED;
-
-  for (let r = dataStartR0; r <= range.e.r; r++) {
-    const premiumValue = normalizeValue(
-      sheet2[XLSX.utils.encode_cell({ r, c: s2c.premium })]?.v
-    );
-    const premiumCellLower = premiumValue.toLowerCase();
-    if (premiumCellLower !== "premium") continue;
-
-    const modelValue = normalizeValue(
-      sheet2[XLSX.utils.encode_cell({ r, c: s2c.model })]?.v
-    );
-    const modelRawLower = modelValue.toLowerCase();
-    const detected = detectMenuFromModelCell(modelRawLower);
-    const menuType = detected.menuKey;
-    const menuLabel = detected.menuLabel;
-    const menuSetRaw = menus[menuType] ?? menus.agnostic;
-    const menuSet =
-      menuType === "exGambling" && menuSetRaw.size === 0
-        ? menus.agnostic
-        : menuSetRaw;
-    const externalId = normalizeValue(
-      sheet2[XLSX.utils.encode_cell({ r, c: s2c.externalId })]?.v
-    );
-    const portfolioName = normalizeValue(
-      sheet2[XLSX.utils.encode_cell({ r, c: 0 })]?.v
-    ) || `row-${r + 1}`;
-    const owner = normalizeValue(
-      sheet2[XLSX.utils.encode_cell({ r, c: s2c.owner })]?.v
-    );
-
-    if (!externalId) {
-      result.warnings.push(
-        `Sheet2 row ${r + 1} (${portfolioName}) is premium but has empty External ID.`
-      );
-      continue;
-    }
-
-    result.checked += 1;
-    const holdingsRows = holdingsIndex.get(externalId) ?? [];
-    if (holdingsRows.length === 0) {
-      result.warnings.push(
-        `No eligible tickers in "${holdingsName}" Code column for External ID "${externalId}" (${portfolioName}).`
-      );
-      result.compliant += 1;
-      continue;
-    }
-
-    const unique = [...new Set(holdingsRows.map((h) => h.ticker))];
-    const offenders = unique.filter(
-      (t) => !menuSet.has(t) && !WHITELISTED_TICKERS.has(t)
-    );
-    if (offenders.length > 0) {
-      const offendersWithOwner = offenders.map((ticker) => {
-        const row = holdingsRows.find((h) => h.ticker === ticker);
-        return {
-          ticker,
-          sheet1Owner: row?.owner ?? "",
-        };
-      });
-      result.flagged.push({
-        row: r + 1,
-        portfolioName,
-        owner,
-        externalId,
-        menuType,
-        tickersChecked: unique,
-        offenders: offendersWithOwner,
-        premiumValue,
-        modelValue,
-        menuLabel,
-      });
-    } else {
-      result.compliant += 1;
-    }
-  }
-
-  return result;
 }
 
-function printResult(result) {
-  const base = path.basename(result.file);
-  if (result.fatal) {
-    console.error(`\n[ERROR] ${base}: ${result.fatal}`);
-    return;
+function workerConcurrencyFor(fileCount) {
+  const raw = process.env.PREMIUM_MENU_WORKERS;
+  const parsed = raw !== undefined && raw !== "" ? Number(raw) : NaN;
+  const fromEnv =
+    Number.isFinite(parsed) && parsed >= 1 ? Math.floor(parsed) : 4;
+  const cpus = Math.max(1, os.cpus().length - 1);
+  return Math.max(1, Math.min(fromEnv, cpus, fileCount));
+}
+
+function runEvaluateWorkerOnce(worker, filePath) {
+  return new Promise((resolve, reject) => {
+    const onMsg = (msg) => {
+      worker.off("message", onMsg);
+      worker.off("error", onErr);
+      resolve(msg);
+    };
+    const onErr = (err) => {
+      worker.off("message", onMsg);
+      worker.off("error", onErr);
+      reject(err);
+    };
+    worker.on("message", onMsg);
+    worker.on("error", onErr);
+    worker.postMessage({ type: "evaluate", filePath });
+  });
+}
+
+/** Step between progress lines when PREMIUM_MENU_PROGRESS_EVERY is unset (~40 updates for large runs). */
+function progressLogInterval(total) {
+  const raw = process.env.PREMIUM_MENU_PROGRESS_EVERY;
+  if (raw !== undefined && raw !== "") {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 1) return Math.floor(n);
+  }
+  if (total <= 0) return 1;
+  const step = Math.floor(total / 40);
+  return Math.max(5, Math.min(250, step || 5));
+}
+
+async function processFilesWithWorkerPool(files, menusPayload, concurrency) {
+  const total = files.length;
+  const progressEvery = progressLogInterval(total);
+  let completed = 0;
+
+  function noteWorkbookDone() {
+    completed += 1;
+    const pct = Math.round((100 * completed) / total);
+    const isFirst = completed === 1;
+    const isLast = completed === total;
+    const isMilestone =
+      progressEvery > 0 &&
+      completed % progressEvery === 0 &&
+      !isLast;
+    if (isFirst || isLast || isMilestone) {
+      console.error(
+        `[INFO] Progress: ${completed}/${total} workbooks (${pct}%)`
+      );
+    }
   }
 
-  console.error(
-    `\n[FILE] ${base}\n  checked: ${result.checked}\n  compliant: ${result.compliant}\n  flagged: ${result.flagged.length}\n  warnings: ${result.warnings.length}`
-  );
-
-  for (const warning of result.warnings) {
-    console.error(`  [WARN] ${warning}`);
-  }
-
-  for (const item of result.flagged) {
-    const offenderCodes = item.offenders.map((o) => o.ticker).join(",");
-    console.error(
-      `  [FLAG] portfolio=${item.portfolioName} row=${item.row} owner=${JSON.stringify(item.owner)} externalId=${item.externalId} menu=${item.menuType} offenders=${offenderCodes}`
+  const workers = [];
+  for (let i = 0; i < concurrency; i++) {
+    workers.push(
+      new Worker(fileURLToPath(WORKER_URL), {
+        workerData: { menusPayload },
+      })
     );
+  }
+  try {
+    const results = new Array(files.length);
+    let next = 0;
+    function getNextIndex() {
+      const i = next;
+      next += 1;
+      return i < files.length ? i : null;
+    }
+    await Promise.all(
+      workers.map((worker) =>
+        (async () => {
+          while (true) {
+            const i = getNextIndex();
+            if (i === null) break;
+            const filePath = files[i];
+            const msg = await runEvaluateWorkerOnce(worker, filePath);
+            if (!msg.ok) {
+              results[i] = {
+                file: msg.filePath ?? filePath,
+                fatal: `Failed to read workbook: ${msg.error}`,
+                checked: 0,
+                compliant: 0,
+                flagged: [],
+                warnings: [],
+              };
+            } else {
+              results[i] = msg.result;
+            }
+            noteWorkbookDone();
+          }
+        })()
+      )
+    );
+    return results;
+  } finally {
+    for (const w of workers) {
+      try {
+        w.postMessage({ type: "shutdown" });
+      } catch {
+        /* ignore */
+      }
+      await w.terminate().catch(() => {});
+    }
   }
 }
 
 async function main() {
-  const inputPath = process.argv[2];
-  if (!inputPath) {
-    console.error(
-      "Usage: node check-premium-menu-compliance.js <extract.xlsx|folder>"
-    );
-    process.exit(1);
-  }
+  const explicitPath = process.argv[2]?.trim();
+  const useDefaultExtracts = !explicitPath;
 
   let menus;
   try {
@@ -813,8 +432,26 @@ async function main() {
   printMenuTables(menus);
 
   let files;
+  let selectedRunFolder = null;
   try {
-    files = await listInputFiles(inputPath);
+    if (useDefaultExtracts) {
+      const discovered = await listWorkbooksFromDefaultExtractsRoot(
+        DEFAULT_EXTRACTS_ROOT
+      );
+      files = discovered.files;
+      selectedRunFolder = discovered.selectedRunFolder;
+      if (selectedRunFolder) {
+        console.error(
+          `[INFO] Default extracts root ${DEFAULT_EXTRACTS_ROOT}: using newest run folder "${selectedRunFolder}" (${discovered.runFolderCount} candidate(s)), ${files.length} workbook(s)`
+        );
+      } else {
+        console.error(
+          `[INFO] Default extracts root ${DEFAULT_EXTRACTS_ROOT}: no Run rebal extract template-* folders found`
+        );
+      }
+    } else {
+      files = await listInputFiles(explicitPath);
+    }
   } catch (err) {
     console.error(`[FATAL] ${err.message}`);
     process.exit(1);
@@ -825,7 +462,17 @@ async function main() {
     process.exit(1);
   }
 
-  console.error(`[INFO] Processing ${files.length} workbook(s)`);
+  const concurrency = workerConcurrencyFor(files.length);
+  console.error(
+    `[INFO] Processing ${files.length} workbook(s) with ${concurrency} worker thread(s)`
+  );
+
+  const menusPayload = menusToSerializable(menus);
+  const results = await processFilesWithWorkerPool(
+    files,
+    menusPayload,
+    concurrency
+  );
 
   const aggregate = {
     files: 0,
@@ -837,27 +484,8 @@ async function main() {
 
   const offendingRows = [];
 
-  for (const filePath of files) {
+  for (const result of results) {
     aggregate.files += 1;
-    let workbook;
-    try {
-      const buf = await fs.readFile(filePath);
-      workbook = XLSX.read(buf, READ_OPTS);
-    } catch (err) {
-      const fatalResult = {
-        file: filePath,
-        fatal: `Failed to read workbook: ${err.message}`,
-        checked: 0,
-        compliant: 0,
-        flagged: [],
-        warnings: [],
-      };
-      printResult(fatalResult);
-      aggregate.fatalFiles += 1;
-      continue;
-    }
-
-    const result = evaluateWorkbook(filePath, workbook, menus);
     printResult(result);
 
     if (result.fatal) {
@@ -875,6 +503,10 @@ async function main() {
           mmpwModelPortfolio: item.premiumValue ?? "",
           directEquitiesModel: item.modelValue ?? "",
           menu: item.menuLabel ?? item.menuType ?? "",
+          entityId: o.entityId ?? "",
+          externalId: item.externalId ?? "",
+          entityName: item.owner ?? "",
+          portfolioName: item.portfolioName ?? "",
           owner: o.sheet1Owner ?? "",
           offender: o.ticker,
         });
@@ -882,12 +514,17 @@ async function main() {
     }
   }
 
+  sortOffendingRowsForSnapshot(offendingRows);
+
   const generatedAt = new Date();
-  const runDate = formatLocalYmd(generatedAt);
+  const runDate = await resolveSnapshotRunDateYmd({
+    useDefaultExtracts,
+    selectedRunFolder,
+    explicitPath: explicitPath || null,
+  });
   const snapshot = {
-    runDate,
     summary: {
-      // Instant file was written (ISO 8601 UTC, e.g. ...Z); convert to local in consumers.
+      runDate,
       generated_at: generatedAt.toISOString(),
       files: aggregate.files,
       premium_portfolios_checked: aggregate.checked,
