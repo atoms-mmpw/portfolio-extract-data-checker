@@ -19,9 +19,9 @@
  *  4. Resolve workbook file list (see step 1). If none found, [FATAL] and exit 1.
  *  5. Evaluate each file in parallel via worker threads (concurrency from PREMIUM_MENU_WORKERS
  *     or CPU count); stderr progress while running; then printResult() in original file order.
- *  6. Write JSON snapshot under OFFENDING_OUTPUT_DIR: summary.runDate and filename
- *     offending-portfolios-{runDate}.json use the extract run folder date when derivable from
- *     Run rebal extract template-* (else today's local date); summary.generated_at is write time.
+ *  6. Write JSON snapshot under OFFENDING_OUTPUT_DIR: summary includes inspected_extracts_directory
+ *     (folder containing the workbooks), runDate, generated_at; filename offending-portfolios-{runDate}.json
+ *     uses the extract run folder date when derivable from Run rebal extract template-* (else today's local date).
  *     Prune snapshots older than 6 months. Print [SUMMARY] totals. Exit 1 if any file had a fatal
  *     error or any [FLAG] rows; exit 0 only when every file succeeded and no violations.
  *
@@ -516,6 +516,8 @@ async function main() {
 
   sortOffendingRowsForSnapshot(offendingRows);
 
+  const inspectedExtractsDirectory = path.dirname(path.resolve(files[0]));
+
   const generatedAt = new Date();
   const runDate = await resolveSnapshotRunDateYmd({
     useDefaultExtracts,
@@ -526,6 +528,7 @@ async function main() {
     summary: {
       runDate,
       generated_at: generatedAt.toISOString(),
+      inspected_extracts_directory: inspectedExtractsDirectory,
       files: aggregate.files,
       premium_portfolios_checked: aggregate.checked,
       compliant: aggregate.compliant,
@@ -547,7 +550,7 @@ async function main() {
   await pruneOldOffendingSnapshots(OFFENDING_OUTPUT_DIR);
 
   console.error(
-    `\n[SUMMARY]\n  files: ${aggregate.files}\n  premium_portfolios_checked: ${aggregate.checked}\n  compliant: ${aggregate.compliant}\n  flagged: ${aggregate.flagged}\n  fatal_files: ${aggregate.fatalFiles}`
+    `\n[SUMMARY]\n  inspected_extracts_directory: ${inspectedExtractsDirectory}\n  files: ${aggregate.files}\n  premium_portfolios_checked: ${aggregate.checked}\n  compliant: ${aggregate.compliant}\n  flagged: ${aggregate.flagged}\n  fatal_files: ${aggregate.fatalFiles}`
   );
 
   if (aggregate.fatalFiles > 0 || aggregate.flagged > 0) {
